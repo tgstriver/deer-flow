@@ -26,10 +26,12 @@ help:
 	@echo "  make install         - Install all dependencies (frontend + backend + pre-commit hooks)"
 	@echo "  make setup-sandbox   - Pre-pull sandbox container image (recommended)"
 	@echo "  make dev             - Start all services in development mode (with hot-reloading)"
+	@echo "  make frontend-nginx  - Start Frontend and Nginx in development mode (with hot-reloading)"
 	@echo "  make dev-daemon      - Start dev services in background (daemon mode)"
 	@echo "  make start           - Start all services in production mode (optimized, no hot-reloading)"
 	@echo "  make start-daemon    - Start prod services in background (daemon mode)"
 	@echo "  make stop            - Stop all running services"
+	@echo "  make stop-frontend-nginx            - Stop Frontend and Nginx services"
 	@echo "  make clean           - Clean up processes and temporary files"
 	@echo ""
 	@echo "Docker Production Commands:"
@@ -116,6 +118,14 @@ setup-sandbox:
 dev:
 	@$(PYTHON) ./scripts/check.py
 	@$(RUN_WITH_GIT_BASH) ./scripts/serve.sh --dev
+
+# Start Frontend and Nginx in development mode (with hot-reloading)
+frontend-nginx:
+	@$(PYTHON) ./scripts/check.py
+	@$(RUN_WITH_GIT_BASH) ./scripts/frontend-nginx.sh --dev
+
+stop-frontend-nginx:
+	@$(RUN_WITH_GIT_BASH) ./scripts/frontend-nginx.sh --stop
 
 # Start all services in production mode (with optimizations)
 start:
