@@ -1,13 +1,18 @@
-"""AIO Sandbox Provider — orchestrates sandbox lifecycle with pluggable backends.
+"""AIO Sandbox Provider —— 通过可插拔后端编排沙箱生命周期。
 
-This provider composes:
-- SandboxBackend: how sandboxes are provisioned (local container vs remote/K8s)
+本模块实现沙箱的完整生命周期管理，包括创建、获取、释放和销毁，
+并支持通过可插拔的后端（SandboxBackend）切换沙箱的运行模式：
 
-The provider itself handles:
-- In-process caching for fast repeated access
-- Idle timeout management
-- Graceful shutdown with signal handling
-- Mount computation (thread-specific, skills)
+- 本地模式（LocalContainerBackend）：使用 Docker 或 Apple Container 在本机启动容器
+- 远程/K8s 模式（RemoteSandboxBackend）：连接到预置的 provisioner 服务
+
+Provider 自身负责：
+- 进程内缓存以加速重复访问
+- 空闲超时管理与后台清理线程
+- 优雅关停（atexit + 信号处理）
+- 挂载计算（线程数据目录、技能目录）
+- 热池（warm pool）：释放后容器仍运行，可快速回收，避免冷启动
+- 孤儿容器回收：启动时枚举已有容器并纳入热池
 """
 
 import atexit
@@ -21,9 +26,9 @@ import uuid
 
 try:
     import fcntl
-except ImportError:  # pragma: no cover - Windows fallback
+except ImportError:  # pragma: no cover - Windows 平台回退方案
     fcntl = None  # type: ignore[assignment]
-    import msvcrt
+    import msvcrt  # Windows 平台使用 msvcrt 替代 fcntl
 
 from deerflow.config import get_app_config
 from deerflow.config.paths import VIRTUAL_PATH_PREFIX, get_paths

@@ -2,8 +2,7 @@
 线程数据目录中间件
 
 本模块实现了 ThreadDataMiddleware，负责为每次线程执行创建对应的数据目录结构。
-它是中间件链中的第一个中间件，在 Agent 执行之前运行，确保后续中间件和工具
-可以访问到正确的线程级别工作空间路径。
+它是中间件链中的第一个中间件，在 Agent 执行之前运行，确保后续中间件和工具可以访问到正确的线程级别工作空间路径。
 
 目录结构:
     {base_dir}/users/{user_id}/threads/{thread_id}/user-data/workspace   — 工作空间目录

@@ -1,4 +1,4 @@
-"""澄清中间件：拦截 ask_clarification 工具调用并中断执行，向用户呈现问题。
+"""澄清中间件：拦截 ask_clarification 工具调用（clarification_tool.py）并中断执行，向用户呈现问题。
 
 当模型调用 ask_clarification 工具时，该中间件会：
 1. 在工具执行之前拦截该调用

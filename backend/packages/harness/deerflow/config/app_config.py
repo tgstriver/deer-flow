@@ -1,3 +1,18 @@
+"""DeerFlow 应用全局配置模块。
+
+本模块是配置系统的核心，定义了 AppConfig 主配置类及其加载、缓存、
+热重载机制。AppConfig 聚合了所有子配置（模型、工具、沙箱、内存、
+代理等），并提供从 config.yaml 文件加载配置的完整流程。
+
+配置优先级：
+1. 显式 config_path 参数
+2. DEER_FLOW_CONFIG_PATH 环境变量
+3. 调用方项目根目录下的 config.yaml
+4. 旧版 backend/ 根目录和仓库根目录的 config.yaml（兼容单体仓库）
+
+配置值以 $ 开头的字段会被解析为环境变量引用（如 $OPENAI_API_KEY）。
+"""
+
 import logging
 import os
 from collections.abc import Mapping
@@ -36,41 +51,54 @@ load_dotenv()
 logger = logging.getLogger(__name__)
 
 
+# config.yaml 中 database 节缺失时的默认值
 CONFIG_FILE_DATABASE_DEFAULTS = {
-    "backend": "sqlite",
-    "sqlite_dir": ".deer-flow/data",
+    "backend": "sqlite",  # 默认后端类型：sqlite
+    "sqlite_dir": ".deer-flow/data",  # SQLite 数据文件目录
 }
 
 
 class CircuitBreakerConfig(BaseModel):
-    """Configuration for the LLM Circuit Breaker."""
+    """LLM 熔断器配置（Configuration for the LLM Circuit Breaker）。
 
-    failure_threshold: int = Field(default=5, description="Number of consecutive failures before tripping the circuit")
-    recovery_timeout_sec: int = Field(default=60, description="Time in seconds before attempting to recover the circuit")
+    当 LLM 调用连续失败达到阈值时触发熔断，阻止后续请求直达 LLM，
+    等待恢复超时后重新尝试。
+    """
+
+    failure_threshold: int = Field(default=5, description="Number of consecutive failures before tripping the circuit / 触发熔断前的连续失败次数（默认 5）")
+    recovery_timeout_sec: int = Field(default=60, description="Time in seconds before attempting to recover the circuit / 熔断后尝试恢复的等待时间（秒，默认 60）")
 
 
 def _legacy_config_candidates() -> tuple[Path, ...]:
-    """Return source-tree config.yaml locations for monorepo compatibility."""
+    """返回源码树中的 config.yaml 候选路径，用于单体仓库兼容（Return source-tree config.yaml locations for monorepo compatibility）。"""
     backend_dir = Path(__file__).resolve().parents[4]
     repo_root = backend_dir.parent
     return (backend_dir / "config.yaml", repo_root / "config.yaml")
 
 
 def logging_level_from_config(name: str | None) -> int:
-    """Map ``config.yaml`` ``log_level`` string to a :mod:`logging` level constant."""
+    """将 config.yaml 中的 log_level 字符串映射为 logging 模块的级别常量（Map ``config.yaml`` ``log_level`` string to a :mod:`logging` level constant）。
+
+    Args:
+        name: 日志级别名称（如 "debug"、"info"、"warning"、"error"），None 默认为 "info"。
+
+    Returns:
+        对应的 logging 级别常量（整数），无法识别时返回 logging.INFO。
+    """
     mapping = logging.getLevelNamesMapping()
     return mapping.get((name or "info").strip().upper(), logging.INFO)
 
 
 def apply_logging_level(name: str | None) -> None:
-    """Resolve *name* to a logging level and apply it to the ``deerflow``/``app`` logger hierarchies.
+    """解析日志级别名称并应用到 ``deerflow``/``app`` 日志器层级（Resolve *name* to a logging level and apply it to the ``deerflow``/``app`` logger hierarchies）。
 
-    Only the ``deerflow`` and ``app`` logger levels are changed so that
-    third-party library verbosity (e.g. uvicorn, sqlalchemy) is not
-    affected. Root handler levels are lowered (never raised) so that
-    messages from the configured loggers can propagate through without
-    being filtered, while preserving handler thresholds that may be
-    intentionally restrictive for third-party log output.
+    仅修改 ``deerflow`` 和 ``app`` 日志器的级别，不影响第三方库
+    （如 uvicorn、sqlalchemy）的日志输出。根处理器的级别只会降低（不会升高），
+    以确保已配置日志器的消息可以传播通过，同时保留可能为第三方日志输出
+    设置的限制性阈值。
+
+    Args:
+        name: 日志级别名称，如 "debug"、"info"、"warning"、"error"。
     """
     level = logging_level_from_config(name)
     for logger_name in ("deerflow", "app"):
@@ -81,42 +109,55 @@ def apply_logging_level(name: str | None) -> None:
 
 
 class AppConfig(BaseModel):
-    """Config for the DeerFlow application"""
+    """DeerFlow 应用主配置模型（Config for the DeerFlow application）。
 
-    log_level: str = Field(default="info", description="Logging level for deerflow and app modules (debug/info/warning/error); third-party libraries are not affected")
-    token_usage: TokenUsageConfig = Field(default_factory=TokenUsageConfig, description="Token usage tracking configuration")
-    models: list[ModelConfig] = Field(default_factory=list, description="Available models")
-    sandbox: SandboxConfig = Field(description="Sandbox configuration")
-    tools: list[ToolConfig] = Field(default_factory=list, description="Available tools")
-    tool_groups: list[ToolGroupConfig] = Field(default_factory=list, description="Available tool groups")
-    skills: SkillsConfig = Field(default_factory=SkillsConfig, description="Skills configuration")
-    skill_evolution: SkillEvolutionConfig = Field(default_factory=SkillEvolutionConfig, description="Agent-managed skill evolution configuration")
-    extensions: ExtensionsConfig = Field(default_factory=ExtensionsConfig, description="Extensions configuration (MCP servers and skills state)")
-    tool_search: ToolSearchConfig = Field(default_factory=ToolSearchConfig, description="Tool search / deferred loading configuration")
-    title: TitleConfig = Field(default_factory=TitleConfig, description="Automatic title generation configuration")
-    summarization: SummarizationConfig = Field(default_factory=SummarizationConfig, description="Conversation summarization configuration")
-    memory: MemoryConfig = Field(default_factory=MemoryConfig, description="Memory subsystem configuration")
-    agents_api: AgentsApiConfig = Field(default_factory=AgentsApiConfig, description="Custom-agent management API configuration")
-    acp_agents: dict[str, ACPAgentConfig] = Field(default_factory=dict, description="ACP-compatible agent configuration")
-    subagents: SubagentsAppConfig = Field(default_factory=SubagentsAppConfig, description="Subagent runtime configuration")
-    guardrails: GuardrailsConfig = Field(default_factory=GuardrailsConfig, description="Guardrail middleware configuration")
-    circuit_breaker: CircuitBreakerConfig = Field(default_factory=CircuitBreakerConfig, description="LLM circuit breaker configuration")
-    loop_detection: LoopDetectionConfig = Field(default_factory=LoopDetectionConfig, description="Loop detection middleware configuration")
-    model_config = ConfigDict(extra="allow")
-    database: DatabaseConfig = Field(default_factory=DatabaseConfig, description="Unified database backend configuration")
-    run_events: RunEventsConfig = Field(default_factory=RunEventsConfig, description="Run event storage configuration")
-    checkpointer: CheckpointerConfig | None = Field(default=None, description="Checkpointer configuration")
-    stream_bridge: StreamBridgeConfig | None = Field(default=None, description="Stream bridge configuration")
+    聚合了所有子系统的配置项，是整个配置体系的核心入口。
+    从 config.yaml 加载并解析后，会同步更新各子模块的全局单例配置。
+    """
+
+    log_level: str = Field(default="info", description="Logging level for deerflow and app modules (debug/info/warning/error); third-party libraries are not affected / deerflow 和 app 模块的日志级别；不影响第三方库")
+    token_usage: TokenUsageConfig = Field(default_factory=TokenUsageConfig, description="Token usage tracking configuration / Token 使用量追踪配置")
+    models: list[ModelConfig] = Field(default_factory=list, description="Available models / 可用的模型列表")
+    sandbox: SandboxConfig = Field(description="Sandbox configuration / 沙箱配置")
+    tools: list[ToolConfig] = Field(default_factory=list, description="Available tools / 可用的工具列表")
+    tool_groups: list[ToolGroupConfig] = Field(default_factory=list, description="Available tool groups / 可用的工具组列表")
+    skills: SkillsConfig = Field(default_factory=SkillsConfig, description="Skills configuration / 技能系统配置")
+    skill_evolution: SkillEvolutionConfig = Field(default_factory=SkillEvolutionConfig, description="Agent-managed skill evolution configuration / 代理管理的技能演化配置")
+    extensions: ExtensionsConfig = Field(default_factory=ExtensionsConfig, description="Extensions configuration (MCP servers and skills state) / 扩展配置（MCP 服务器和技能状态）")
+    tool_search: ToolSearchConfig = Field(default_factory=ToolSearchConfig, description="Tool search / deferred loading configuration / 工具搜索/延迟加载配置")
+    title: TitleConfig = Field(default_factory=TitleConfig, description="Automatic title generation configuration / 自动标题生成配置")
+    summarization: SummarizationConfig = Field(default_factory=SummarizationConfig, description="Conversation summarization configuration / 对话摘要配置")
+    memory: MemoryConfig = Field(default_factory=MemoryConfig, description="Memory subsystem configuration / 记忆子系统配置")
+    agents_api: AgentsApiConfig = Field(default_factory=AgentsApiConfig, description="Custom-agent management API configuration / 自定义代理管理 API 配置")
+    acp_agents: dict[str, ACPAgentConfig] = Field(default_factory=dict, description="ACP-compatible agent configuration / ACP 兼容代理配置")
+    subagents: SubagentsAppConfig = Field(default_factory=SubagentsAppConfig, description="Subagent runtime configuration / 子代理运行时配置")
+    guardrails: GuardrailsConfig = Field(default_factory=GuardrailsConfig, description="Guardrail middleware configuration / 护栏中间件配置")
+    circuit_breaker: CircuitBreakerConfig = Field(default_factory=CircuitBreakerConfig, description="LLM circuit breaker configuration / LLM 熔断器配置")
+    loop_detection: LoopDetectionConfig = Field(default_factory=LoopDetectionConfig, description="Loop detection middleware configuration / 循环检测中间件配置")
+    model_config = ConfigDict(extra="allow")  # 允许额外字段，兼容配置文件中的自定义项
+    database: DatabaseConfig = Field(default_factory=DatabaseConfig, description="Unified database backend configuration / 统一数据库后端配置")
+    run_events: RunEventsConfig = Field(default_factory=RunEventsConfig, description="Run event storage configuration / 运行事件存储配置")
+    checkpointer: CheckpointerConfig | None = Field(default=None, description="Checkpointer configuration / 检查点配置")
+    stream_bridge: StreamBridgeConfig | None = Field(default=None, description="Stream bridge configuration / 流桥接配置")
 
     @classmethod
     def resolve_config_path(cls, config_path: str | None = None) -> Path:
-        """Resolve the config file path.
+        """解析配置文件路径（Resolve the config file path）。
 
-        Priority:
-        1. If provided `config_path` argument, use it.
-        2. If provided `DEER_FLOW_CONFIG_PATH` environment variable, use it.
-        3. Otherwise, search the caller project root.
-        4. Finally, search legacy backend/repository-root defaults for monorepo compatibility.
+        优先级：
+        1. 若提供了 `config_path` 参数，直接使用。
+        2. 若设置了 `DEER_FLOW_CONFIG_PATH` 环境变量，使用它。
+        3. 否则，搜索调用方项目根目录。
+        4. 最后，搜索旧版 backend/ 根目录和仓库根目录（兼容单体仓库）。
+
+        Args:
+            config_path: 可选的配置文件路径。
+
+        Returns:
+            解析后的配置文件路径。
+
+        Raises:
+            FileNotFoundError: 配置文件未找到。
         """
         if config_path:
             path = Path(config_path)

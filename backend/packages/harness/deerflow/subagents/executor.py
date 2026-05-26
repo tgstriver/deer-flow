@@ -1,4 +1,21 @@
-"""Subagent execution engine."""
+"""子代理执行引擎。
+
+本模块提供子代理的完整执行能力，包括：
+- 同步和异步执行模式
+- 隔离事件循环管理（防止与父代理冲突）
+- 后台任务调度和轮询
+- 实时状态更新和进度报告
+- Token 使用统计收集
+- 协作式取消和超时处理
+- 技能加载和工具过滤
+- 分布式追踪（trace_id）
+
+架构设计：
+- 使用持久化事件循环避免每次执行创建新循环
+- 线程池调度器管理后台任务
+- ContextVar 复制保持上下文隔离
+- 线程安全的结果存储和状态管理
+"""
 
 import asyncio
 import atexit
@@ -31,6 +48,7 @@ from deerflow.subagents.token_collector import SubagentTokenCollector
 logger = logging.getLogger(__name__)
 
 
+# 程序启动时清理可能存在的旧事件循环实例
 _previous_shutdown_isolated_subagent_loop = globals().get("_shutdown_isolated_subagent_loop")
 if callable(_previous_shutdown_isolated_subagent_loop):
     atexit.unregister(_previous_shutdown_isolated_subagent_loop)
@@ -38,7 +56,16 @@ if callable(_previous_shutdown_isolated_subagent_loop):
 
 
 class SubagentStatus(Enum):
-    """Status of a subagent execution."""
+    """子代理执行状态枚举。
+
+    Attributes:
+        PENDING: 任务已创建，等待执行
+        RUNNING: 任务正在执行
+        COMPLETED: 任务成功完成
+        FAILED: 任务执行失败
+        CANCELLED: 任务被用户取消
+        TIMED_OUT: 任务执行超时
+    """
 
     PENDING = "pending"
     RUNNING = "running"
@@ -49,6 +76,11 @@ class SubagentStatus(Enum):
 
     @property
     def is_terminal(self) -> bool:
+        """检查是否为终端状态（不可再转换的状态）。
+
+        Returns:
+            True 如果是终端状态，否则 False
+        """
         return self in {
             type(self).COMPLETED,
             type(self).FAILED,
@@ -59,17 +91,23 @@ class SubagentStatus(Enum):
 
 @dataclass
 class SubagentResult:
-    """Result of a subagent execution.
+    """子代理执行结果。
+
+    该数据类保存子代理执行的完整状态和结果信息。
 
     Attributes:
-        task_id: Unique identifier for this execution.
-        trace_id: Trace ID for distributed tracing (links parent and subagent logs).
-        status: Current status of the execution.
-        result: The final result message (if completed).
-        error: Error message (if failed).
-        started_at: When execution started.
-        completed_at: When execution completed.
-        ai_messages: List of complete AI messages (as dicts) generated during execution.
+        task_id: 唯一标识符，用于追踪执行
+        trace_id: 分布式追踪 ID（连接父代理和子代理日志）
+        status: 当前执行状态
+        result: 最终结果消息（如果完成）
+        error: 错误消息（如果失败）
+        started_at: 执行开始时间
+        completed_at: 执行完成时间
+        ai_messages: 执行期间生成的 AI 消息列表（字典格式）
+        token_usage_records: Token 使用记录列表
+        usage_reported: 是否已报告使用情况
+        cancel_event: 用于协作取消的线程事件
+        _state_lock: 用于保护状态转换的线程锁
     """
 
     task_id: str
@@ -86,7 +124,7 @@ class SubagentResult:
     _state_lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
 
     def __post_init__(self):
-        """Initialize mutable defaults."""
+        """初始化可变默认值。"""
         if self.ai_messages is None:
             self.ai_messages = []
 
@@ -100,11 +138,24 @@ class SubagentResult:
         ai_messages: list[dict[str, Any]] | None = None,
         token_usage_records: list[dict[str, int | str]] | None = None,
     ) -> bool:
-        """Set a terminal status exactly once.
+        """原子性地设置终端状态（仅一次）。
 
-        Background timeout/cancellation and the execution worker can race on the
-        same result holder.  The first terminal transition wins; late terminal
-        writes must not change status or payload fields.
+        后台超时/取消和执行工作者可能在同一结果对象上竞争。
+        第一个终端转换获胜；延迟的终端写入不能更改状态或有效载荷字段。
+
+        Args:
+            status: 要设置的终端状态
+            result: 成功结果消息
+            error: 错误消息
+            completed_at: 完成时间（默认当前时间）
+            ai_messages: AI 消息列表
+            token_usage_records: Token 使用记录
+
+        Returns:
+            True 如果成功设置，False 如果已经是终端状态
+
+        Raises:
+            ValueError: 如果 status 不是终端状态
         """
         if not status.is_terminal:
             raise ValueError(f"Status {status} is not terminal")
@@ -126,16 +177,15 @@ class SubagentResult:
             return True
 
 
-# Global storage for background task results
+# 后台任务结果的全局存储
 _background_tasks: dict[str, SubagentResult] = {}
 _background_tasks_lock = threading.Lock()
 
-# Thread pool for background task scheduling and orchestration
+# 后台任务调度和编排的线程池
 _scheduler_pool = ThreadPoolExecutor(max_workers=3, thread_name_prefix="subagent-scheduler-")
 
-# Persistent event loop for isolated subagent executions triggered from an
-# already-running parent loop. Reusing one long-lived loop avoids creating a
-# fresh loop per execution and then closing async resources bound to it.
+# 持久化事件循环，用于从已运行的父循环触发的隔离子代理执行。
+# 重用这个长期存在的循环避免每次执行创建新循环并关闭绑定到它的异步资源。
 _isolated_subagent_loop: asyncio.AbstractEventLoop | None = None
 _isolated_subagent_loop_thread: threading.Thread | None = None
 _isolated_subagent_loop_started: threading.Event | None = None
@@ -146,7 +196,12 @@ def _run_isolated_subagent_loop(
     loop: asyncio.AbstractEventLoop,
     started_event: threading.Event,
 ) -> None:
-    """Run the persistent isolated subagent loop in a dedicated daemon thread."""
+    """在专用守护线程中运行持久化隔离子代理循环。
+
+    Args:
+        loop: 事件循环实例
+        started_event: 启动事件，用于信号循环已准备就绪
+    """
     asyncio.set_event_loop(loop)
     loop.call_soon(started_event.set)
     try:
@@ -156,7 +211,10 @@ def _run_isolated_subagent_loop(
 
 
 def _shutdown_isolated_subagent_loop() -> None:
-    """Stop and close the persistent isolated subagent loop."""
+    """停止并关闭持久化隔离子代理循环。
+
+    程序退出时调用，确保事件循环正确清理。
+    """
     global _isolated_subagent_loop, _isolated_subagent_loop_thread, _isolated_subagent_loop_started
 
     with _isolated_subagent_loop_lock:
@@ -193,7 +251,16 @@ atexit.register(_shutdown_isolated_subagent_loop)
 
 
 def _get_isolated_subagent_loop() -> asyncio.AbstractEventLoop:
-    """Return the persistent event loop used by isolated subagent executions."""
+    """返回隔离子代理执行使用的持久化事件循环。
+
+    如果循环不存在或不再可用，则创建新循环。
+
+    Returns:
+        事件循环实例
+
+    Raises:
+        RuntimeError: 如果启动循环超时
+    """
     global _isolated_subagent_loop, _isolated_subagent_loop_thread, _isolated_subagent_loop_started
     with _isolated_subagent_loop_lock:
         thread_is_alive = _isolated_subagent_loop_thread is not None and _isolated_subagent_loop_thread.is_alive()
@@ -227,7 +294,15 @@ def _submit_to_isolated_loop_in_context(
     context: Context,
     coro_factory: Callable[[], Coroutine[Any, Any, SubagentResult]],
 ) -> Future[SubagentResult]:
-    """Submit a coroutine to the isolated loop while preserving ContextVar state."""
+    """在保留 ContextVar 状态的情况下向隔离循环提交协程。
+
+    Args:
+        context: 父级上下文，包含所有 ContextVar 的值
+        coro_factory: 创建协程的工厂函数
+
+    Returns:
+        Future 对象，用于获取执行结果
+    """
     return context.run(
         lambda: asyncio.run_coroutine_threadsafe(
             coro_factory(),
@@ -241,24 +316,24 @@ def _filter_tools(
     allowed: list[str] | None,
     disallowed: list[str] | None,
 ) -> list[BaseTool]:
-    """Filter tools based on subagent configuration.
+    """根据子代理配置过滤工具。
 
     Args:
-        all_tools: List of all available tools.
-        allowed: Optional allowlist of tool names. If provided, only these tools are included.
-        disallowed: Optional denylist of tool names. These tools are always excluded.
+        all_tools: 所有可用工具的列表
+        allowed: 可选的工具名称允许列表。如果提供，只包含这些工具。
+        disallowed: 可选的工具名称禁止列表。这些工具始终被排除。
 
     Returns:
-        Filtered list of tools.
+        过滤后的工具列表
     """
     filtered = all_tools
 
-    # Apply allowlist if specified
+    # 如果指定了允许列表，应用过滤
     if allowed is not None:
         allowed_set = set(allowed)
         filtered = [t for t in filtered if t.name in allowed_set]
 
-    # Apply denylist
+    # 应用禁止列表
     if disallowed is not None:
         disallowed_set = set(disallowed)
         filtered = [t for t in filtered if t.name not in disallowed_set]
@@ -267,7 +342,15 @@ def _filter_tools(
 
 
 class SubagentExecutor:
-    """Executor for running subagents."""
+    """子代理执行器。
+
+    负责初始化和执行子代理任务，包括：
+    - 模型和工具配置
+    - 技能加载和工具过滤
+    - 同步和异步执行模式
+    - 后台任务调度
+    - 分布式追踪
+    """
 
     def __init__(
         self,
@@ -280,26 +363,24 @@ class SubagentExecutor:
         thread_id: str | None = None,
         trace_id: str | None = None,
     ):
-        """Initialize the executor.
+        """初始化执行器。
 
         Args:
-            config: Subagent configuration.
-            tools: List of all available tools (will be filtered).
-            app_config: Resolved AppConfig. When None, ``_create_agent`` falls
-                back to ``get_app_config()`` (matches the lead-agent factory's
-                pattern).
-            parent_model: The parent agent's model name for inheritance.
-            sandbox_state: Sandbox state from parent agent.
-            thread_data: Thread data from parent agent.
-            thread_id: Thread ID for sandbox operations.
-            trace_id: Trace ID from parent for distributed tracing.
+            config: 子代理配置
+            tools: 所有可用工具的列表（将被过滤）
+            app_config: 已解析的 AppConfig。当为 None 时，``_create_agent`` 将
+                回退到 ``get_app_config()``（与主代理工厂模式匹配）。
+            parent_model: 父代理的模型名称，用于继承
+            sandbox_state: 父代理的沙箱状态
+            thread_data: 父代理的线程数据
+            thread_id: 线程 ID，用于沙箱操作
+            trace_id: 父代理的追踪 ID，用于分布式追踪
         """
         self.config = config
         self.app_config = app_config
         self.parent_model = parent_model
-        # Resolve eagerly only when it does not require loading config.yaml; otherwise defer
-        # to _create_agent (which already loads app_config) so unit tests can construct
-        # executors without a config file present.
+        # 仅在不需要加载 config.yaml 时预先解析；否则延迟到 _create_agent
+        # （已加载 app_config），以便单元测试可以在没有配置文件的情况下构造执行器
         if config.model != "inherit" or parent_model is not None or app_config is not None:
             self.model_name: str | None = resolve_subagent_model_name(config, parent_model, app_config=app_config)
         else:
@@ -307,7 +388,7 @@ class SubagentExecutor:
         self.sandbox_state = sandbox_state
         self.thread_data = thread_data
         self.thread_id = thread_id
-        # Generate trace_id if not provided (for top-level calls)
+        # 如果未提供则生成 trace_id（用于顶层调用）
         self.trace_id = trace_id or str(uuid.uuid4())[:8]
 
         self._base_tools = _filter_tools(
@@ -320,7 +401,18 @@ class SubagentExecutor:
         logger.info(f"[trace={self.trace_id}] SubagentExecutor initialized: {config.name} with {len(self.tools)} tools")
 
     def _create_agent(self, tools: list[BaseTool] | None = None):
-        """Create the agent instance."""
+        """创建代理实例。
+
+        Args:
+            tools: 可选的工具列表，如果不提供则使用 self.tools
+
+        Returns:
+            创建好的代理实例
+
+        Note:
+            - system_prompt 包含在初始状态消息中（见 _build_initial_state）
+            - 避免创建多个 SystemMessage，某些 LLM API 不支持
+        """
         app_config = self.app_config or get_app_config()
         if self.model_name is None:
             self.model_name = resolve_subagent_model_name(self.config, self.parent_model, app_config=app_config)
@@ -328,11 +420,11 @@ class SubagentExecutor:
 
         from deerflow.agents.middlewares.tool_error_handling_middleware import build_subagent_runtime_middlewares
 
-        # Reuse shared middleware composition with lead agent.
+        # 与主代理重用共享中间件组合
         middlewares = build_subagent_runtime_middlewares(app_config=app_config, model_name=self.model_name, lazy_init=True)
 
-        # system_prompt is included in initial state messages (see _build_initial_state)
-        # to avoid multiple SystemMessages which some LLM APIs don't support.
+        # system_prompt 包含在初始状态消息中（见 _build_initial_state）
+        # 避免多个 SystemMessage，某些 LLM API 不支持
         return create_agent(
             model=model,
             tools=tools if tools is not None else self.tools,
@@ -342,7 +434,20 @@ class SubagentExecutor:
         )
 
     async def _load_skills(self) -> list[Skill]:
-        """Load enabled skill metadata based on config.skills."""
+        """根据 config.skills 加载启用的技能元数据。
+
+        Returns:
+            加载的技能列表
+
+        Raises:
+            Exception: 如果技能加载失败
+
+        Note:
+            - 如果 config.skills 为空列表，跳过加载
+            - 使用 asyncio.to_thread 避免阻塞事件循环（LangGraph ASGI 要求）
+            - 如果 config.skills 为 None，加载所有启用的技能
+            - 如果 config.skills 有值，只加载白名单中的技能
+        """
         if self.config.skills is not None and len(self.config.skills) == 0:
             logger.info(f"[trace={self.trace_id}] Subagent {self.config.name} skills=[] — skipping skill loading")
             return []
@@ -352,7 +457,7 @@ class SubagentExecutor:
 
             storage_kwargs = {"app_config": self.app_config} if self.app_config is not None else {}
             storage = await asyncio.to_thread(get_or_new_skill_storage, **storage_kwargs)
-            # Use asyncio.to_thread to avoid blocking the event loop (LangGraph ASGI requirement)
+            # 使用 asyncio.to_thread 避免阻塞事件循环（LangGraph ASGI 要求）
             all_skills = await asyncio.to_thread(storage.load_skills, enabled_only=True)
             logger.info(f"[trace={self.trace_id}] Subagent {self.config.name} loaded {len(all_skills)} enabled skills from disk")
         except Exception:
@@ -363,33 +468,43 @@ class SubagentExecutor:
             logger.info(f"[trace={self.trace_id}] Subagent {self.config.name} no enabled skills found")
             return []
 
-        # Filter by config.skills whitelist
+        # 按 config.skills 白名单过滤
         if self.config.skills is not None:
             allowed = set(self.config.skills)
             return [s for s in all_skills if s.name in allowed]
         return all_skills
 
     def _apply_skill_allowed_tools(self, skills: list[Skill]) -> list[BaseTool]:
+        """根据技能允许的工具列表过滤工具。
+
+        Args:
+            skills: 技能列表
+
+        Returns:
+            过滤后的工具列表
+        """
         return filter_tools_by_skill_allowed_tools(self._base_tools, skills)
 
     async def _load_skill_messages(self, skills: list[Skill]) -> list[SystemMessage]:
-        """Load skill content as conversation items based on config.skills.
+        """根据 config.skills 加载技能内容作为对话项目。
 
-        Aligned with Codex's pattern: each subagent loads its own skills
-        per-session and injects them as conversation items (developer messages),
-        not as system prompt text. The config.skills whitelist controls which
-        skills are loaded:
-        - None: load all enabled skills
-        - []: no skills
-        - ["skill-a", "skill-b"]: only these skills
+        与 Codex 模式对齐：每个子代理按会话加载自己的技能，
+        并将它们作为对话项目（开发者消息）注入，而不是作为系统提示文本。
+        config.skills 白名单控制加载哪些技能：
+        - None: 加载所有启用的技能
+        - []: 不加载技能
+        - ["skill-a", "skill-b"]: 只加载这些技能
+
+        Args:
+            skills: 技能列表
 
         Returns:
-            List of SystemMessages containing skill content.
+            包含技能内容的 SystemMessage 列表
         """
         if not skills:
             return []
 
-        # Read each skill's SKILL.md content and create conversation items
+        # 读取每个技能的 SKILL.md 内容并创建对话项目
         messages = []
         for skill in skills:
             try:
@@ -404,23 +519,27 @@ class SubagentExecutor:
         return messages
 
     async def _build_initial_state(self, task: str) -> tuple[dict[str, Any], list[BaseTool]]:
-        """Build the initial state for agent execution.
+        """构建代理执行的初始状态。
 
         Args:
-            task: The task description.
+            task: 任务描述
 
         Returns:
-            Initial state dictionary and tools filtered by loaded skill metadata.
+            二元组：（初始状态字典，按加载的技能元数据过滤的工具列表）
+
+        Note:
+            - 将 system_prompt 和技能合并为单个 SystemMessage
+            - 某些 LLM API 拒绝多个 SystemMessage
+            - 传递父代理的沙箱和线程数据
         """
 
-        # Load skills as conversation items (Codex pattern)
+        # 加载技能作为对话项目（Codex 模式）
         skills = await self._load_skills()
         filtered_tools = self._apply_skill_allowed_tools(skills)
         skill_messages = await self._load_skill_messages(skills)
 
-        # Combine system_prompt and skills into a single SystemMessage.
-        # Some LLM APIs reject multiple SystemMessages with
-        # "System message must be at the beginning."
+        # 将 system_prompt 和技能合并为单个 SystemMessage。
+        # 某些 LLM API 拒绝多个 SystemMessage，报错 "System message must be at the beginning."
         system_parts: list[str] = []
         if self.config.system_prompt:
             system_parts.append(self.config.system_prompt)
@@ -431,14 +550,14 @@ class SubagentExecutor:
         if system_parts:
             messages.append(SystemMessage(content="\n\n".join(system_parts)))
 
-        # Then the actual task
+        # 然后是实际任务
         messages.append(HumanMessage(content=task))
 
         state: dict[str, Any] = {
             "messages": messages,
         }
 
-        # Pass through sandbox and thread data from parent
+        # 从父代理传递沙箱和线程数据
         if self.sandbox_state is not None:
             state["sandbox"] = self.sandbox_state
         if self.thread_data is not None:
@@ -447,20 +566,26 @@ class SubagentExecutor:
         return state, filtered_tools
 
     async def _aexecute(self, task: str, result_holder: SubagentResult | None = None) -> SubagentResult:
-        """Execute a task asynchronously.
+        """异步执行任务。
 
         Args:
-            task: The task description for the subagent.
-            result_holder: Optional pre-created result object to update during execution.
+            task: 子代理的任务描述
+            result_holder: 可选的预创建结果对象，在执行期间更新
 
         Returns:
-            SubagentResult with the execution result.
+            包含执行结果的 SubagentResult
+
+        Note:
+            - 使用流式执行以获取实时更新
+            - 收集 AI 消息用于进度报告
+            - 支持协作式取消
+            - 收集 Token 使用统计
         """
         if result_holder is not None:
-            # Use the provided result holder (for async execution with real-time updates)
+            # 使用提供的结果持有者（用于带实时更新的异步执行）
             result = result_holder
         else:
-            # Create a new result for synchronous execution
+            # 为同步执行创建新结果
             task_id = str(uuid.uuid4())[:8]
             result = SubagentResult(
                 task_id=task_id,
@@ -478,11 +603,11 @@ class SubagentExecutor:
             state, filtered_tools = await self._build_initial_state(task)
             agent = self._create_agent(filtered_tools)
 
-            # Token collector for subagent LLM calls
+            # 子代理 LLM 调用的 Token 收集器
             collector_caller = f"subagent:{self.config.name}"
             collector = SubagentTokenCollector(caller=collector_caller)
 
-            # Build config with thread_id for sandbox access and recursion limit
+            # 构建包含 thread_id 的配置，用于沙箱访问和递归限制
             run_config: RunnableConfig = {
                 "recursion_limit": self.config.max_turns,
                 "callbacks": [collector],
@@ -497,11 +622,11 @@ class SubagentExecutor:
 
             logger.info(f"[trace={self.trace_id}] Subagent {self.config.name} starting async execution with max_turns={self.config.max_turns}")
 
-            # Use stream instead of invoke to get real-time updates
-            # This allows us to collect AI messages as they are generated
+            # 使用 stream 而不是 invoke 以获取实时更新
+            # 这允许我们在 AI 消息生成时收集它们
             final_state = None
 
-            # Pre-check: bail out immediately if already cancelled before streaming starts
+            # 预检查：如果已经在流式传输开始前被取消，立即退出
             if result.cancel_event.is_set():
                 logger.info(f"[trace={self.trace_id}] Subagent {self.config.name} cancelled before streaming")
                 result.try_set_terminal(
@@ -512,10 +637,9 @@ class SubagentExecutor:
                 return result
 
             async for chunk in agent.astream(state, config=run_config, context=context, stream_mode="values"):  # type: ignore[arg-type]
-                # Cooperative cancellation: check if parent requested stop.
-                # Note: cancellation is only detected at astream iteration boundaries,
-                # so long-running tool calls within a single iteration will not be
-                # interrupted until the next chunk is yielded.
+                # 协作式取消：检查父代理是否请求停止。
+                # 注意：取消只在 astream 迭代边界检测，
+                # 所以单次迭代中的长时间运行的工具调用不会被中断，直到下一个 chunk 产生。
                 if result.cancel_event.is_set():
                     logger.info(f"[trace={self.trace_id}] Subagent {self.config.name} cancelled by parent")
                     result.try_set_terminal(
@@ -527,16 +651,16 @@ class SubagentExecutor:
 
                 final_state = chunk
 
-                # Extract AI messages from the current state
+                # 从当前状态提取 AI 消息
                 messages = chunk.get("messages", [])
                 if messages:
                     last_message = messages[-1]
-                    # Check if this is a new AI message
+                    # 检查这是否是一个新的 AI 消息
                     if isinstance(last_message, AIMessage):
-                        # Convert message to dict for serialization
+                        # 将消息转换为字典以进行序列化
                         message_dict = last_message.model_dump()
-                        # Only add if it's not already in the list (avoid duplicates)
-                        # Check by comparing message IDs if available, otherwise compare full dict
+                        # 只有在列表中不存在时才添加（避免重复）
+                        # 如果有 message ID 则通过 ID 比较，否则比较完整字典
                         message_id = message_dict.get("id")
                         is_duplicate = False
                         if message_id:
@@ -556,11 +680,11 @@ class SubagentExecutor:
                 logger.warning(f"[trace={self.trace_id}] Subagent {self.config.name} no final state")
                 final_result = "No response generated"
             else:
-                # Extract the final message - find the last AIMessage
+                # 提取最终消息 - 查找最后一个 AIMessage
                 messages = final_state.get("messages", [])
                 logger.info(f"[trace={self.trace_id}] Subagent {self.config.name} final messages count: {len(messages)}")
 
-                # Find the last AIMessage in the conversation
+                # 在对话中查找最后一个 AIMessage
                 last_ai_message = None
                 for msg in reversed(messages):
                     if isinstance(msg, AIMessage):
@@ -569,13 +693,12 @@ class SubagentExecutor:
 
                 if last_ai_message is not None:
                     content = last_ai_message.content
-                    # Handle both str and list content types for the final result
+                    # 为最终结果处理 str 和 list 两种内容类型
                     if isinstance(content, str):
                         final_result = content
                     elif isinstance(content, list):
-                        # Extract text from list of content blocks for final result only.
-                        # Concatenate raw string chunks directly, but preserve separation
-                        # between full text blocks for readability.
+                        # 从内容块列表中提取文本，仅用于最终结果。
+                        # 直接连接原始字符串块，但保留完整文本块之间的分隔以提高可读性。
                         text_parts = []
                         pending_str_parts = []
                         for block in content:
@@ -594,7 +717,7 @@ class SubagentExecutor:
                     else:
                         final_result = str(content)
                 elif messages:
-                    # Fallback: use the last message if no AIMessage found
+                    # 回退：如果没找到 AIMessage，使用最后一条消息
                     last_message = messages[-1]
                     logger.warning(f"[trace={self.trace_id}] Subagent {self.config.name} no AIMessage found, using last message: {type(last_message)}")
                     raw_content = last_message.content if hasattr(last_message, "content") else str(last_message)
@@ -642,13 +765,22 @@ class SubagentExecutor:
         return result
 
     def _execute_in_isolated_loop(self, task: str, result_holder: SubagentResult | None = None) -> SubagentResult:
-        """Execute the subagent on the persistent isolated event loop.
+        """在持久化隔离子代理循环上执行任务。
 
-        This method is used by the sync ``execute()`` path when the caller is
-        already running inside an event loop. Because ``execute()`` is a sync
-        API, this path blocks the caller while the actual coroutine runs on the
-        long-lived isolated loop. Reusing that loop keeps shared async clients
-        from being tied to a short-lived loop that gets closed per execution.
+        此方法被同步 ``execute()`` 路径使用，当调用者已经在事件循环中运行时。
+        因为 ``execute()`` 是同步 API，此路径在实际协程在长期存在的隔离循环上运行时
+        阻塞调用者。重用该循环避免共享异步客户端（如 httpx 客户端）
+        被绑定到每次执行关闭的短期循环。
+
+        Args:
+            task: 任务描述
+            result_holder: 可选的结果持有者
+
+        Returns:
+            执行结果
+
+        Raises:
+            FuturesTimeoutError: 如果执行超时
         """
         future: Future[SubagentResult] | None = None
         parent_context = copy_context()
@@ -678,22 +810,21 @@ class SubagentExecutor:
             raise
 
     def execute(self, task: str, result_holder: SubagentResult | None = None) -> SubagentResult:
-        """Execute a task synchronously (wrapper around async execution).
+        """同步执行任务（异步执行的包装器）。
 
-        This method runs the async execution in a new event loop, allowing
-        asynchronous tools (like MCP tools) to be used within the thread pool.
+        此方法在新的事件循环中运行异步执行，允许在
+        线程池中使用异步工具（如 MCP 工具）。
 
-        When called from within an already-running event loop (e.g., when the
-        parent agent is async), this method synchronously waits on the
-        persistent isolated loop to avoid event loop conflicts with shared
-        async primitives like httpx clients.
+        当从已在运行的事件循环内调用时（例如，当父代理是异步时），
+        此方法同步等待持久化隔离循环，以避免与共享
+        异步原语（如 httpx 客户端）的事件循环冲突。
 
         Args:
-            task: The task description for the subagent.
-            result_holder: Optional pre-created result object to update during execution.
+            task: 子代理的任务描述
+            result_holder: 可选的预创建结果对象，在执行期间更新
 
         Returns:
-            SubagentResult with the execution result.
+            包含执行结果的 SubagentResult
         """
         try:
             try:
@@ -705,11 +836,11 @@ class SubagentExecutor:
                 logger.debug(f"[trace={self.trace_id}] Subagent {self.config.name} detected running event loop, using isolated loop")
                 return self._execute_in_isolated_loop(task, result_holder)
 
-            # Standard path: no running event loop, use asyncio.run
+            # 标准路径：没有运行的事件循环，使用 asyncio.run
             return asyncio.run(self._aexecute(task, result_holder))
         except Exception as e:
             logger.exception(f"[trace={self.trace_id}] Subagent {self.config.name} execution failed")
-            # Create a result with error if we don't have one
+            # 如果没有结果对象，创建带错误的新结果
             if result_holder is not None:
                 result = result_holder
             else:
@@ -722,20 +853,25 @@ class SubagentExecutor:
             return result
 
     def execute_async(self, task: str, task_id: str | None = None) -> str:
-        """Start a task execution in the background.
+        """在后台启动任务执行。
 
         Args:
-            task: The task description for the subagent.
-            task_id: Optional task ID to use. If not provided, a random UUID will be generated.
+            task: 子代理的任务描述
+            task_id: 可选的任务 ID。如果未提供，将生成随机 UUID。
 
         Returns:
-            Task ID that can be used to check status later.
+            任务 ID，可用于稍后检查状态
+
+        Note:
+            - 创建初始待处理结果
+            - 提交到调度器线程池
+            - 直接提交到持久化隔离循环，避免 execute() 创建临时循环
         """
-        # Use provided task_id or generate a new one
+        # 使用提供的 task_id 或生成新的
         if task_id is None:
             task_id = str(uuid.uuid4())[:8]
 
-        # Create initial pending result
+        # 创建初始待处理结果
         result = SubagentResult(
             task_id=task_id,
             trace_id=self.trace_id,
@@ -749,26 +885,33 @@ class SubagentExecutor:
 
         parent_context = copy_context()
 
-        # Submit to scheduler pool
+        # 提交到调度器线程池
         def run_task():
+            """在后台线程中运行任务。
+
+            Note:
+                - 更新任务状态为 RUNNING
+                - 直接提交到持久化隔离循环
+                - 处理超时和异常
+                - 使用协作式取消机制
+            """
             with _background_tasks_lock:
                 _background_tasks[task_id].status = SubagentStatus.RUNNING
                 _background_tasks[task_id].started_at = datetime.now()
                 result_holder = _background_tasks[task_id]
 
             try:
-                # Submit execution directly to the persistent isolated loop so the
-                # background path does not create a temporary loop via execute().
+                # 直接提交执行到持久化隔离循环，避免后台路径通过 execute() 创建临时循环。
                 execution_future = _submit_to_isolated_loop_in_context(
                     parent_context,
                     lambda: self._aexecute(task, result_holder),
                 )
                 try:
-                    # Wait for execution with timeout
+                    # 等待执行带超时
                     execution_future.result(timeout=self.config.timeout_seconds)
                 except FuturesTimeoutError:
                     logger.error(f"[trace={self.trace_id}] Subagent {self.config.name} execution timed out after {self.config.timeout_seconds}s")
-                    # Signal cooperative cancellation and cancel the future
+                    # 信号协作式取消并取消 future
                     result_holder.cancel_event.set()
                     result_holder.try_set_terminal(
                         SubagentStatus.TIMED_OUT,
@@ -785,19 +928,25 @@ class SubagentExecutor:
         return task_id
 
 
+# 最大并发子代理数
+# 用于限制同时执行的子代理数量，避免资源耗尽
 MAX_CONCURRENT_SUBAGENTS = 3
 
 
 def request_cancel_background_task(task_id: str) -> None:
-    """Signal a running background task to stop.
+    """请求取消运行中的后台任务。
 
-    Sets the cancel_event on the task, which is checked cooperatively
-    by ``_aexecute`` during ``agent.astream()`` iteration.  This allows
-    subagent threads — which cannot be force-killed via ``Future.cancel()``
-    — to stop at the next iteration boundary.
+    设置任务的 cancel_event，由 ``_aexecute`` 在 ``agent.astream()``
+    迭代期间协作检查。这允许子代理线程（不能通过 ``Future.cancel()``
+    强制终止）在下一次迭代边界停止。
 
     Args:
-        task_id: The task ID to cancel.
+        task_id: 要取消的任务 ID
+
+    Note:
+        - 使用协作式取消机制，非强制终止
+        - 取消请求是异步的，任务可能不会立即停止
+        - 线程安全，使用锁保护
     """
     with _background_tasks_lock:
         result = _background_tasks.get(task_id)
@@ -807,49 +956,68 @@ def request_cancel_background_task(task_id: str) -> None:
 
 
 def get_background_task_result(task_id: str) -> SubagentResult | None:
-    """Get the result of a background task.
+    """获取后台任务的结果。
+
+    用于查询后台任务的执行状态和结果。
+    调用者可以轮询此方法直到任务进入终端状态。
 
     Args:
-        task_id: The task ID returned by execute_async.
+        task_id: execute_async 返回的任务 ID
 
     Returns:
-        SubagentResult if found, None otherwise.
+        如果找到则返回 SubagentResult，否则返回 None
+
+    Note:
+        - 线程安全，使用锁保护
+        - 返回结果对象的引用，调用者应只读访问
     """
     with _background_tasks_lock:
         return _background_tasks.get(task_id)
 
 
 def list_background_tasks() -> list[SubagentResult]:
-    """List all background tasks.
+    """列出所有后台任务。
+
+    返回所有后台任务的快照，包括待处理、运行中和已完成的任务。
+    可用于监控和调试目的。
 
     Returns:
-        List of all SubagentResult instances.
+        所有 SubagentResult 实例的列表（副本）
+
+    Note:
+        - 返回列表的副本，不会影响内部状态
+        - 线程安全，使用锁保护
     """
     with _background_tasks_lock:
         return list(_background_tasks.values())
 
 
 def cleanup_background_task(task_id: str) -> None:
-    """Remove a completed task from background tasks.
+    """清理已完成的任务，释放内存。
 
-    Should be called by task_tool after it finishes polling and returns the result.
-    This prevents memory leaks from accumulated completed tasks.
+    应该在 task_tool 完成轮询并返回结果后调用。
+    这防止已完成任务累积导致内存泄漏。
 
-    Only removes tasks that are in a terminal state (COMPLETED/FAILED/TIMED_OUT)
-    to avoid race conditions with the background executor still updating the task entry.
+    只移除处于终端状态（COMPLETED/FAILED/TIMED_OUT）的任务，
+    避免与后台执行器仍在更新任务条目产生竞争条件。
 
     Args:
-        task_id: The task ID to remove.
+        task_id: 要移除的任务 ID
+
+    Note:
+        - 只清理终端状态的任务
+        - 如果任务不存在，仅记录 debug 日志
+        - 线程安全，使用锁保护
+        - 防止内存泄漏的重要机制
     """
     with _background_tasks_lock:
         result = _background_tasks.get(task_id)
         if result is None:
-            # Nothing to clean up; may have been removed already.
+            # 没有需要清理的；可能已被移除
             logger.debug("Requested cleanup for unknown background task %s", task_id)
             return
 
-        # Only clean up tasks that are in a terminal state to avoid races with
-        # the background executor still updating the task entry.
+        # 只清理处于终端状态的任务，避免与后台执行器仍在更新任务条目产生竞争
         if result.status.is_terminal or result.completed_at is not None:
             del _background_tasks[task_id]
             logger.debug("Cleaned up background task: %s", task_id)

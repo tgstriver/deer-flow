@@ -1,3 +1,18 @@
+"""本地沙箱实现 — 在宿主机文件系统上直接执行命令与文件操作的沙箱。
+
+本模块实现了 LocalSandbox 类，继承自抽象 Sandbox 基类，
+在宿主机本地文件系统上执行命令和文件操作，而非在隔离容器中。
+
+核心特性：
+- 路径映射（PathMapping）：将容器虚拟路径（如 /mnt/skills）映射到宿主机实际路径，
+  支持只读挂载标记，防止对技能目录等敏感路径的写操作
+- 双向路径解析：命令执行前将容器路径解析为本地路径，输出返回时将本地路径反解析为容器路径，
+  确保 Agent 始终看到统一的虚拟路径空间
+- Shell 检测与适配：自动检测可用的 Shell（zsh/bash/sh/PowerShell/cmd），
+  对 MSYS/Git Bash 等特殊 Shell 设置环境变量防止路径转换问题
+- 安全防护：路径遍历检测、只读挂载检查、符号链接逃逸防护
+"""
+
 import errno
 import ntpath
 import os
@@ -14,7 +29,16 @@ from deerflow.sandbox.search import GrepMatch, find_glob_matches, find_grep_matc
 
 @dataclass(frozen=True)
 class PathMapping:
-    """A path mapping from a container path to a local path with optional read-only flag."""
+    """路径映射配置 — 定义容器虚拟路径到宿主机本地路径的映射关系。
+
+    用于 LocalSandbox 中将 Agent 看到的容器路径（如 /mnt/skills）
+    映射到宿主机上的实际路径。read_only 标记用于保护技能目录等敏感路径。
+
+    Attributes:
+        container_path: 容器内的虚拟路径（Agent 视角），如 "/mnt/skills"。
+        local_path: 容器路径对应的宿主机实际文件系统路径。
+        read_only: 是否为只读挂载，默认为 False。只读挂载禁止写操作。
+    """
 
     container_path: str
     local_path: str
@@ -22,31 +46,90 @@ class PathMapping:
 
 
 class ResolvedPath(NamedTuple):
+    """路径解析结果 — 包含解析后的本地路径和匹配的映射关系。
+
+    当路径能匹配某个 PathMapping 时，mapping 字段记录具体的映射配置；
+    当路径不匹配任何映射时，mapping 为 None，路径保持原样。
+
+    Attributes:
+        path: 解析后的本地绝对路径。
+        mapping: 匹配的 PathMapping 实例，无匹配时为 None。
+    """
+
     path: str
     mapping: PathMapping | None
 
 
 class LocalSandbox(Sandbox):
+    """本地沙箱实现 — 在宿主机文件系统上执行命令与文件操作。
+
+    继承自抽象 Sandbox 基类，通过路径映射机制将容器虚拟路径
+    （如 /mnt/user-data/workspace、/mnt/skills）映射到宿主机实际路径，
+    实现 Agent 视角与物理路径之间的双向转换。
+
+    安全机制：
+    - 只读挂载检查：对标记为 read_only 的映射路径禁止写操作
+    - 路径遍历防护：检测解析后的路径是否逃逸出映射的本地根目录
+    - 符号链接防护：跳过符号链接和指向根目录外的解析路径
+    - Agent 写入追踪：仅对 Agent 写入的文件进行路径反解析，
+      保留用户上传和外部工具输出的原始内容不变
+    """
+
     @staticmethod
     def _shell_name(shell: str) -> str:
-        """Return the executable name for a shell path or command."""
+        """提取 Shell 可执行文件名 — 从完整路径中获取 Shell 名称。
+
+        将路径中的反斜杠统一为正斜杠，然后取最后一段并转为小写，
+        用于后续的 Shell 类型判断（如是否为 PowerShell、cmd.exe 等）。
+
+        Args:
+            shell: Shell 的完整路径或命令名，如 "/bin/zsh"、"powershell.exe"。
+
+        Returns:
+            Shell 可执行文件名的小写形式，如 "zsh"、"powershell.exe"。
+        """
         return shell.replace("\\", "/").rsplit("/", 1)[-1].lower()
 
     @staticmethod
     def _is_powershell(shell: str) -> bool:
-        """Return whether the selected shell is a PowerShell executable."""
+        """判断是否为 PowerShell Shell — 检测 Windows PowerShell 或 pwsh。
+
+        Args:
+            shell: Shell 路径或命令名。
+
+        Returns:
+            如果是 PowerShell 可执行文件则返回 True。
+        """
         return LocalSandbox._shell_name(shell) in {"powershell", "powershell.exe", "pwsh", "pwsh.exe"}
 
     @staticmethod
     def _is_cmd_shell(shell: str) -> bool:
-        """Return whether the selected shell is cmd.exe."""
+        """判断是否为 cmd.exe Shell — 检测 Windows 命令提示符。
+
+        Args:
+            shell: Shell 路径或命令名。
+
+        Returns:
+            如果是 cmd.exe 可执行文件则返回 True。
+        """
         return LocalSandbox._shell_name(shell) in {"cmd", "cmd.exe"}
 
     @staticmethod
     def _is_msys_shell(shell: str) -> bool:
-        """Return whether the selected shell is a Git Bash/MSYS shell."""
+        """判断是否为 MSYS/Git Bash Shell — 检测 Git Bash 或 MSYS 环境。
+
+        Git Bash 和 MSYS 会自动进行路径转换（如 /c/Users 变为 C:\\Users），
+        通过设置 MSYS_NO_PATHCONV 和 MSYS2_ARG_CONV_EXCL 环境变量来禁用此行为。
+
+        Args:
+            shell: Shell 路径或命令名。
+
+        Returns:
+            如果是 MSYS/Git Bash Shell 则返回 True。
+        """
         normalized = shell.replace("\\", "/").lower()
         shell_name = LocalSandbox._shell_name(shell)
+        # 检查 Shell 名称是否为 sh.exe/bash.exe，且路径中包含 /git/、/mingw、/msys 特征
         return shell_name in {"sh.exe", "bash.exe"} and any(part in normalized for part in ("/git/", "/mingw", "/msys"))
 
     @staticmethod

@@ -1,12 +1,11 @@
 """子代理并发限制中间件。
 
 本模块实现了对单次模型响应中并发的子代理（subagent）工具调用数量的硬性限制。
-当大语言模型在一次回复中生成超过最大并发数的 "task" 工具调用时，
+当大语言模型在一次回复中生成超过最大并发数的"task"工具调用时，
 该中间件会截断多余的调用，仅保留前 max_concurrent 个，丢弃其余部分。
-这种方式比基于提示词（prompt）的限制更加可靠，因为 LLM 并不总是严格遵守
-提示词中关于并发数量的约束。
+这种方式比基于提示词（prompt）的限制更加可靠，因为 LLM 并不总是严格遵守提示词中关于并发数量的约束。
 
-该中间件在 Agent 中间件链中排在第 16 位（可选，仅当 subagent_enabled 时启用），
+该中间件在 Agent 中间件链中排在第16位（可选，仅当 subagent_enabled 时启用），
 作用于模型响应之后（after_model / aafter_model）的阶段。
 """
 
@@ -77,10 +76,8 @@ class SubagentLimitMiddleware(AgentMiddleware[AgentState]):
             3. 检查该消息是否包含工具调用，若无则返回 None
             4. 统计名称为 "task" 的工具调用的索引位置
             5. 若 "task" 调用数量未超过限制，则无需截断，返回 None
-            6. 若超过限制，构建需要丢弃的工具调用索引集合（超出限制的部分），
-               过滤掉这些索引对应的工具调用，生成截断后的列表
-            7. 使用 clone_ai_message_with_tool_calls 创建替换后的 AIMessage，
-               返回包含更新消息的字典
+            6. 若超过限制，构建需要丢弃的工具调用索引集合（超出限制的部分），过滤掉这些索引对应的工具调用，生成截断后的列表
+            7. 使用 clone_ai_message_with_tool_calls 创建替换后的 AIMessage，返回包含更新消息的字典
 
         Args:
             state: 当前 Agent 状态，包含消息列表等信息。

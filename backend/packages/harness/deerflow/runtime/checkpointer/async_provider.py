@@ -1,16 +1,24 @@
-"""Async checkpointer factory.
+"""异步检查点工厂。
+
+Async checkpointer factory.
+
+为长时间运行的异步服务器提供**异步上下文管理器**，确保正确的资源清理。
 
 Provides an **async context manager** for long-running async servers that need
 proper resource cleanup.
 
+支持的后端：memory（内存）、sqlite、postgres。
+
 Supported backends: memory, sqlite, postgres.
 
-Usage (e.g. FastAPI lifespan)::
+用法示例（如 FastAPI lifespan）::
 
     from deerflow.runtime.checkpointer.async_provider import make_checkpointer
 
     async with make_checkpointer() as checkpointer:
         app.state.checkpointer = checkpointer  # InMemorySaver if not configured
+
+同步用法请参考 :mod:`deerflow.runtime.checkpointer.provider`。
 
 For sync usage see :mod:`deerflow.runtime.checkpointer.provider`.
 """
@@ -35,26 +43,34 @@ from deerflow.runtime.store._sqlite_utils import ensure_sqlite_parent_dir, resol
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Async factory
+# 异步工厂 / Async factory
 # ---------------------------------------------------------------------------
 
 
 @contextlib.asynccontextmanager
 async def _async_checkpointer(config) -> AsyncIterator[Checkpointer]:
-    """Async context manager that constructs and tears down a checkpointer."""
+    """异步上下文管理器，构造并销毁检查点存储。
+
+    Async context manager that constructs and tears down a checkpointer.
+
+    根据配置类型返回对应的检查点存储实例，退出时自动清理资源。
+    """
     if config.type == "memory":
+        # 内存模式：使用 InMemorySaver，进程内非持久化
         from langgraph.checkpoint.memory import InMemorySaver
 
         yield InMemorySaver()
         return
 
     if config.type == "sqlite":
+        # SQLite模式：使用异步 SQLite 检查点存储
         try:
             from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
         except ImportError as exc:
             raise ImportError(SQLITE_INSTALL) from exc
 
         conn_str = resolve_sqlite_conn_str(config.connection_string or "store.db")
+        # 在线程中确保 SQLite 父目录存在（避免阻塞事件循环）
         await asyncio.to_thread(ensure_sqlite_parent_dir, conn_str)
         async with AsyncSqliteSaver.from_conn_string(conn_str) as saver:
             await saver.setup()
@@ -62,6 +78,7 @@ async def _async_checkpointer(config) -> AsyncIterator[Checkpointer]:
         return
 
     if config.type == "postgres":
+        # PostgreSQL模式：使用异步 Postgres 检查点存储
         try:
             from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
         except ImportError as exc:

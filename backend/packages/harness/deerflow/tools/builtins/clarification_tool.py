@@ -1,3 +1,10 @@
+"""澄清请求工具 (Clarification Tool)
+
+本模块提供 ask_clarification_tool，用于 Agent 在需要更多信息时向用户提问。
+当 Agent 无法继续执行而需要用户输入时，通过此工具中断执行并呈现问题。
+实际的拦截逻辑由 ClarificationMiddleware 处理，本工具仅作为触发器。
+"""
+
 from typing import Literal
 
 from langchain.tools import tool

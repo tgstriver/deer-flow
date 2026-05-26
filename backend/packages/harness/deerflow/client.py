@@ -1,17 +1,20 @@
-"""DeerFlowClient — Embedded Python client for DeerFlow agent system.
+"""DeerFlowClient — DeerFlow 代理系统的嵌入式 Python 客户端。
 
-Provides direct programmatic access to DeerFlow's agent capabilities
-without requiring LangGraph Server or Gateway API processes.
+提供对 DeerFlow 代理能力的直接编程访问，无需运行 LangGraph Server 或 Gateway API 进程。
 
-Usage:
+本客户端在进程内直接导入与 Gateway API 相同的 deerflow 模块，共享相同的配置文件和数据目录，
+无 FastAPI 依赖。所有返回类型与 Gateway API 响应格式对齐，使得消费者代码在 HTTP 和嵌入式模式下
+可以无缝切换。
+
+用法:
     from deerflow.client import DeerFlowClient
 
     client = DeerFlowClient()
-    response = client.chat("Analyze this paper for me", thread_id="my-thread")
+    response = client.chat("帮我分析这篇论文", thread_id="my-thread")
     print(response)
 
-    # Streaming
-    for event in client.stream("hello"):
+    # 流式输出
+    for event in client.stream("你好"):
         print(event)
 """
 
@@ -55,22 +58,23 @@ from deerflow.uploads.manager import (
 
 logger = logging.getLogger(__name__)
 
-
+# 流事件类型枚举：与 LangGraph SSE 协议对齐
 StreamEventType = Literal["values", "messages-tuple", "custom", "end"]
 
 
 @dataclass
 class StreamEvent:
-    """A single event from the streaming agent response.
+    """流式代理响应中的单个事件。
 
-    Event types align with the LangGraph SSE protocol:
-        - ``"values"``: Full state snapshot (title, messages, artifacts).
-        - ``"messages-tuple"``: Per-message update (AI text, tool calls, tool results).
-        - ``"end"``: Stream finished.
+    事件类型与 LangGraph SSE 协议对齐：
+        - ``"values"``：完整状态快照（标题、消息列表、产出物）。
+        - ``"messages-tuple"``：逐消息更新（AI文本、工具调用、工具结果）。
+        - ``"custom"``：自定义事件，由 StreamWriter 转发。
+        - ``"end"``：流式输出结束。
 
     Attributes:
-        type: Event type.
-        data: Event payload. Contents vary by type.
+        type: 事件类型。
+        data: 事件载荷，内容随类型不同而变化。
     """
 
     type: StreamEventType
@@ -78,35 +82,31 @@ class StreamEvent:
 
 
 class DeerFlowClient:
-    """Embedded Python client for DeerFlow agent system.
+    """DeerFlow 代理系统的嵌入式 Python 客户端。
 
-    Provides direct programmatic access to DeerFlow's agent capabilities
-    without requiring LangGraph Server or Gateway API processes.
+    提供对 DeerFlow 代理能力的直接编程访问，无需运行 LangGraph Server 或 Gateway API 进程。
 
-    Note:
-        Multi-turn conversations require a ``checkpointer``. Without one,
-        each ``stream()`` / ``chat()`` call is stateless — ``thread_id``
-        is only used for file isolation (uploads / artifacts).
+    注意:
+        多轮对话需要提供 ``checkpointer``。没有 checkpointer 时，每次 ``stream()`` / ``chat()``
+        调用都是无状态的——``thread_id`` 仅用于文件隔离（上传 / 产出物）。
 
-        The system prompt (including date, memory, and skills context) is
-        generated when the internal agent is first created and cached until
-        the configuration key changes. Call :meth:`reset_agent` to force
-        a refresh in long-running processes.
+        系统提示词（包括日期、记忆和技能上下文）在内部代理首次创建时生成，并缓存直到配置键发生变化。
+        在长时间运行的进程中，调用 :meth:`reset_agent` 强制刷新。
 
-    Example::
+    示例::
 
         from deerflow.client import DeerFlowClient
 
         client = DeerFlowClient()
 
-        # Simple one-shot
-        print(client.chat("hello"))
+        # 简单单次对话
+        print(client.chat("你好"))
 
-        # Streaming
-        for event in client.stream("hello"):
+        # 流式输出
+        for event in client.stream("你好"):
             print(event.type, event.data)
 
-        # Configuration queries
+        # 配置查询
         print(client.list_models())
         print(client.list_skills())
     """
@@ -124,22 +124,22 @@ class DeerFlowClient:
         available_skills: set[str] | None = None,
         middlewares: Sequence[AgentMiddleware] | None = None,
     ):
-        """Initialize the client.
+        """初始化客户端。
 
-        Loads configuration but defers agent creation to first use.
+        加载配置但延迟代理创建到首次使用时。
 
         Args:
-            config_path: Path to config.yaml. Uses default resolution if None.
-            checkpointer: LangGraph checkpointer instance for state persistence.
-                Required for multi-turn conversations on the same thread_id.
-                Without a checkpointer, each call is stateless.
-            model_name: Override the default model name from config.
-            thinking_enabled: Enable model's extended thinking.
-            subagent_enabled: Enable subagent delegation.
-            plan_mode: Enable TodoList middleware for plan mode.
-            agent_name: Name of the agent to use.
-            available_skills: Optional set of skill names to make available. If None (default), all scanned skills are available.
-            middlewares: Optional list of custom middlewares to inject into the agent.
+            config_path: config.yaml 的路径。None 时使用默认路径解析。
+            checkpointer: LangGraph checkpointer 实例，用于状态持久化。
+                多轮对话在同一 thread_id 上时需要此参数。
+                没有 checkpointer 时，每次调用是无状态的。
+            model_name: 覆盖配置中的默认模型名称。
+            thinking_enabled: 启用模型的扩展思考模式。
+            subagent_enabled: 启用子代理委派。
+            plan_mode: 启用 TodoList 中间件的计划模式。
+            agent_name: 使用的代理名称。
+            available_skills: 可用技能名称集合。None 时所有扫描到的技能都可用。
+            middlewares: 可选的自定义中间件列表，注入到代理中。
         """
         if config_path is not None:
             reload_app_config(config_path)

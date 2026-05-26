@@ -1,9 +1,17 @@
-"""General-purpose subagent configuration."""
+"""通用子代理配置 —— 定义适用于复杂多步骤任务的通用子代理。
+
+该子代理继承父代理的所有工具，能够同时进行探索和修改操作，
+适合需要复杂推理、多步依赖执行和独立上下文管理的任务。
+
+General-purpose subagent configuration.
+"""
 
 from deerflow.subagents.config import SubagentConfig
 
+# 通用子代理配置实例
 GENERAL_PURPOSE_CONFIG = SubagentConfig(
     name="general-purpose",
+    # 描述信息：指导主代理何时应委派给此子代理 / Description: guides the parent agent on when to delegate
     description="""A capable agent for complex, multi-step tasks that require both exploration and action.
 
 Use this subagent when:
@@ -13,6 +21,7 @@ Use this subagent when:
 - The task would benefit from isolated context management
 
 Do NOT use for simple, single-step operations.""",
+    # 系统提示词：定义子代理的行为规范 / System prompt: defines the subagent's behavior guidelines
     system_prompt="""You are a general-purpose subagent working on a delegated task. Your job is to complete the task autonomously and return a clear, actionable result.
 
 <guidelines>
@@ -43,8 +52,12 @@ You have access to the same sandbox environment as the parent agent:
 - Prefer relative paths from the workspace, such as `hello.txt`, `../uploads/input.csv`, and `../outputs/result.md`, when writing scripts or shell commands
 </working_directory>
 """,
-    tools=None,  # Inherit all tools from parent
-    disallowed_tools=["task", "ask_clarification", "present_files"],  # Prevent nesting and clarification
+    # 继承父代理的所有工具 / Inherit all tools from parent
+    tools=None,
+    # 禁止的工具：防止嵌套委派、澄清请求和文件展示 / Prevent nesting, clarification, and file presentation
+    disallowed_tools=["task", "ask_clarification", "present_files"],
+    # 模型继承父代理 / Inherit model from parent agent
     model="inherit",
+    # 通用子代理允许最多 100 轮交互 / Allow up to 100 agent turns
     max_turns=100,
 )

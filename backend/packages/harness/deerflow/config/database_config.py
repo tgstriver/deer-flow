@@ -1,32 +1,25 @@
-"""Unified database backend configuration.
+"""统一数据库后端配置模块。
 
-Controls BOTH the LangGraph checkpointer and the DeerFlow application
-persistence layer (runs, threads metadata, users, etc.). The user
-configures one backend; the system handles physical separation details.
+同时控制 LangGraph 检查点和 DeerFlow 应用持久化层（运行记录、线程元数据、用户等）。
+用户只需配置一个后端，系统自动处理物理隔离细节。
 
-SQLite mode: checkpointer and app share a single .db file
-({sqlite_dir}/deerflow.db) with WAL journal mode enabled on every
-connection. WAL allows concurrent readers and a single writer without
-blocking, making a unified file safe for both workloads.  Writers
-that contend for the lock wait via the default 5-second sqlite3
-busy timeout rather than failing immediately.
+SQLite 模式：检查点和应用共享同一个 .db 文件（{sqlite_dir}/deerflow.db），
+每个连接启用 WAL 日志模式。WAL 允许并发读取和单一写入而不阻塞，
+使统一文件对两种工作负载安全可用。写入竞争者通过默认 5 秒 sqlite3
+busy timeout 等待而非立即失败。
 
-Postgres mode: both use the same database URL but maintain independent
-connection pools with different lifecycles.
+Postgres 模式：两者使用相同的数据库 URL，但维护独立连接池，生命周期不同。
 
-Memory mode: checkpointer uses MemorySaver, app uses in-memory stores.
-No database is initialized.
+Memory 模式：检查点使用 MemorySaver，应用使用内存存储，不初始化数据库。
 
-Sensitive values (postgres_url) should use $VAR syntax in config.yaml
-to reference environment variables from .env:
+敏感值（postgres_url）应在 config.yaml 中使用 $VAR 语法引用 .env 中的环境变量：
 
     database:
       backend: postgres
       postgres_url: $DATABASE_URL
 
-The $VAR resolution is handled by AppConfig.resolve_env_variables()
-before this config is instantiated -- DatabaseConfig itself does not
-need to do any environment variable processing.
+$VAR 的解析由 AppConfig.resolve_env_variables() 在此配置实例化之前完成——
+DatabaseConfig 本身不需要做任何环境变量处理。
 """
 
 from __future__ import annotations

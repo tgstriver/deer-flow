@@ -172,8 +172,7 @@ def _build_runtime_middlewares(
     - LLMErrorHandlingMiddleware 在工具执行之前规范化 LLM 调用错误
     - GuardrailMiddleware 在 LLM 错误处理后进行工具调用前的授权检查
     - SandboxAuditMiddleware 在工具执行前审计沙箱操作
-    - ToolErrorHandlingMiddleware 必须在最后，确保所有前置中间件处理完毕后
-      才捕获工具执行异常并转换为错误 ToolMessage
+    - ToolErrorHandlingMiddleware 必须在最后，确保所有前置中间件处理完毕后才捕获工具执行异常并转换为错误 ToolMessage
 
     Args:
         app_config: 应用配置对象，提供模型、防护栏等配置信息。

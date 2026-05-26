@@ -1,6 +1,9 @@
-"""SkillStorage singleton + reflection-based factory.
+"""技能存储单例工厂与反射式实例化模块。
 
-Mirrors the pattern used by ``deerflow/sandbox/sandbox_provider.py``.
+本模块提供 SkillStorage 的获取与生命周期管理，采用与
+``deerflow/sandbox/sandbox_provider.py`` 相同的设计模式。
+核心函数 ``get_or_new_skill_storage`` 根据调用参数决定返回
+进程级单例或新实例，确保不同场景下配置隔离与共享的正确性。
 """
 
 from __future__ import annotations
