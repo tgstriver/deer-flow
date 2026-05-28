@@ -1,4 +1,13 @@
-"""Prompt templates for memory update and injection."""
+"""记忆更新和注入的提示词模板。
+
+本模块提供:
+- MEMORY_UPDATE_PROMPT: 用于基于对话更新记忆的提示词
+- FACT_EXTRACTION_PROMPT: 用于从单条消息提取事实的提示词
+- format_memory_for_injection: 将记忆数据格式化为系统提示注入
+- format_conversation_for_update: 将对话格式化为记忆更新输入
+- Token 计数工具(使用 tiktoken)
+- 置信度处理工具
+"""
 
 import math
 import re
@@ -161,33 +170,43 @@ Return ONLY valid JSON."""
 
 
 def _count_tokens(text: str, encoding_name: str = "cl100k_base") -> int:
-    """Count tokens in text using tiktoken.
-
+    """使用 tiktoken 计算文本中的 token 数量。
+    
     Args:
-        text: The text to count tokens for.
-        encoding_name: The encoding to use (default: cl100k_base for GPT-4/3.5).
-
+        text: 要计算 token 的文本
+        encoding_name: 使用的编码(默认: cl100k_base 用于 GPT-4/3.5)
+        
     Returns:
-        The number of tokens in the text.
+        文本中的 token 数量
+        
+    Note:
+        - 如果 tiktoken 不可用，回退到字符数 // 4 的估算
+        - 发生异常时也回退到字符估算
     """
     if not TIKTOKEN_AVAILABLE:
-        # Fallback to character-based estimation if tiktoken is not available
+        # 如果 tiktoken 不可用，回退到基于字符的估算
         return len(text) // 4
 
     try:
         encoding = tiktoken.get_encoding(encoding_name)
         return len(encoding.encode(text))
     except Exception:
-        # Fallback to character-based estimation on error
+        # 发生错误时回退到基于字符的估算
         return len(text) // 4
 
 
 def _coerce_confidence(value: Any, default: float = 0.0) -> float:
-    """Coerce a confidence-like value to a bounded float in [0, 1].
-
-    Non-finite values (NaN, inf, -inf) are treated as invalid and fall back
-    to the default before clamping, preventing them from dominating ranking.
-    The ``default`` parameter is assumed to be a finite value.
+    """将类似置信度的值强制转换为 [0, 1] 范围内的浮点数。
+    
+    非有限值(NaN、inf、-inf) 被视为无效，在夹紧之前回退到默认值，
+    防止它们主导排名。``default`` 参数假定为有限值。
+    
+    Args:
+        value: 要转换的置信度值
+        default: 默认值(当转换失败时使用)
+        
+    Returns:
+        [0, 1] 范围内的置信度浮点数
     """
     try:
         confidence = float(value)

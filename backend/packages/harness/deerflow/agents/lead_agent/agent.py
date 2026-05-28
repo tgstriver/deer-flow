@@ -503,8 +503,8 @@ def _make_lead_agent(config: RunnableConfig, *, app_config: AppConfig):
     resolved_app_config = app_config
 
     # ===== 第一步：解析运行时配置参数 =====
-    thinking_enabled = cfg.get("thinking_enabled", True)  # 是否启用扩展思考
-    reasoning_effort = cfg.get("reasoning_effort", None)  # 推理努力程度
+    thinking_enabled = cfg.get("thinking_enabled", True)  # 是否启用思考
+    reasoning_effort = cfg.get("reasoning_effort", None)  # 推理强度，DeerFlow的前端有四种模式：flash、thinking、pro、ultra
     requested_model_name: str | None = cfg.get("model_name") or cfg.get("model")  # 请求的模型名称
     is_plan_mode = cfg.get("is_plan_mode", False)  # 是否启用计划模式
     subagent_enabled = cfg.get("subagent_enabled", False)  # 是否启用子代理

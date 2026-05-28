@@ -1,4 +1,19 @@
-"""Memory storage providers."""
+"""记忆存储提供者。
+
+本模块定义记忆存储的抽象接口和文件实现:
+- MemoryStorage: 抽象基类，定义 load/reload/save 接口
+- FileMemoryStorage: 基于 JSON 文件的存储实现
+  - 支持多用户和多代理记忆隔离
+  - 带文件修改时间检查的缓存机制
+  - 原子写入(使用临时文件避免损坏)
+- get_memory_storage: 获取配置的存储实例(支持动态加载)
+
+存储策略:
+- 按用户 ID 和代理名称隔离记忆
+- 支持全局记忆和用户级记忆
+- 缓存机制减少文件 I/O
+- 原子操作保证数据完整性
+"""
 
 import abc
 import json

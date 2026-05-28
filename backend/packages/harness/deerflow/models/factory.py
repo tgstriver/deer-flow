@@ -102,9 +102,7 @@ def create_chat_model(name: str | None = None, thinking_enabled: bool = False, *
 
     Args:
         name: 模型名称。若为 None，则使用配置中的第一个模型。
-        thinking_enabled: 是否启用思考/推理模式。为 True 时应用
-            when_thinking_enabled 配置；为 False 时应用 when_thinking_disabled
-            配置或自动生成禁用参数。
+        thinking_enabled: 是否启用思考/推理模式。为 True 时应用when_thinking_enabled 配置；为 False 时应用 when_thinking_disabled配置或自动生成禁用参数。
         app_config: 应用配置实例。若为 None，则通过 get_app_config() 加载。
         **kwargs: 传递给模型构造函数的额外参数（如 reasoning_effort）。
 
